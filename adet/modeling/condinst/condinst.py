@@ -12,7 +12,6 @@ from detectron2.modeling.meta_arch.build import META_ARCH_REGISTRY
 from detectron2.structures.instances import Instances
 from detectron2.structures.masks import polygons_to_bitmask
 
-from .dynamic_mask_head import build_dynamic_mask_head
 from .mask_branch import build_mask_branch
 
 from adet.utils.comm import aligned_bilinear
@@ -35,7 +34,12 @@ class CondInst(nn.Module):
 
         self.backbone = build_backbone(cfg)
         self.proposal_generator = build_proposal_generator(cfg, self.backbone.output_shape())
-        self.mask_head = build_dynamic_mask_head(cfg)
+        if cfg.MODEL.CONDINST.MASK_HEAD.USE_MULTI:
+            from .dynamic_mask_head_multi import build_dynamic_mask_head
+            self.mask_head = build_dynamic_mask_head(cfg)
+        else:
+            from .dynamic_mask_head import build_dynamic_mask_head
+            self.mask_head = build_dynamic_mask_head(cfg)
         self.mask_branch = build_mask_branch(cfg, self.backbone.output_shape())
         self.mask_out_stride = cfg.MODEL.CONDINST.MASK_OUT_STRIDE
         self.max_proposals = cfg.MODEL.CONDINST.MAX_PROPOSALS
