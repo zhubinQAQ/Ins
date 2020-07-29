@@ -230,30 +230,6 @@ _C.MODEL.CONDINST.MASK_BRANCH.SEMANTIC_LOSS_ON = False
 
 
 # ---------------------------------------------------------------------------- #
-# RankInst Options
-# ---------------------------------------------------------------------------- #
-_C.MODEL.RANKINST = CN()
-
-# the downsampling ratio of the final instance masks to the input image
-_C.MODEL.RANKINST.MASK_OUT_STRIDE = 4
-_C.MODEL.RANKINST.MAX_PROPOSALS = -1
-
-_C.MODEL.RANKINST.MASK_HEAD = CN()
-_C.MODEL.RANKINST.MASK_HEAD.CHANNELS = 8
-_C.MODEL.RANKINST.MASK_HEAD.NUM_LAYERS = 3
-_C.MODEL.RANKINST.MASK_HEAD.USE_FP16 = False
-_C.MODEL.RANKINST.MASK_HEAD.DISABLE_REL_COORDS = False
-
-_C.MODEL.RANKINST.MASK_BRANCH = CN()
-_C.MODEL.RANKINST.MASK_BRANCH.OUT_CHANNELS = 8
-_C.MODEL.RANKINST.MASK_BRANCH.IN_FEATURES = ["p3", "p4", "p5"]
-_C.MODEL.RANKINST.MASK_BRANCH.CHANNELS = 128
-_C.MODEL.RANKINST.MASK_BRANCH.NORM = "BN"
-_C.MODEL.RANKINST.MASK_BRANCH.NUM_CONVS = 4
-_C.MODEL.RANKINST.MASK_BRANCH.SEMANTIC_LOSS_ON = False
-
-
-# ---------------------------------------------------------------------------- #
 # TOP Module Options
 # ---------------------------------------------------------------------------- #
 _C.MODEL.TOP_MODULE = CN()

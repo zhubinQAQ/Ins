@@ -56,7 +56,7 @@ def get_grid_map(grid=3):
     grid_tensor = torch.ones([grid**2, 9, 2], dtype=torch.int64) * 100
     grid_tensor[0, [0, 1, 2, 3]] = torch.as_tensor(grid_dict[0]).T
     grid_tensor[1, [0, 2]] = torch.as_tensor(grid_dict[1]).T
-    grid_tensor[2, [0, 2, 3, 4]] = torch.as_tensor(grid_dict[2]).T
+    grid_tensor[2, [0, 3, 4, 5]] = torch.as_tensor(grid_dict[2]).T
     grid_tensor[3, [0, 1]] = torch.as_tensor(grid_dict[3]).T
     grid_tensor[4, [0, ]] = torch.as_tensor(grid_dict[4]).T
     grid_tensor[5, [0, 5]] = torch.as_tensor(grid_dict[5]).T
@@ -245,19 +245,19 @@ class DynamicMaskHead(nn.Module):
                                                                                                 self.in_channels, H, W)
 
         def get_loaction_weights_bias(level_ind, locations, i_weight, i_bias, grid_num=4, grid_inside_num=3):
-            new_locations = locations / 8.  # n, 2(x, y)
-            new_locations[:, 0] = new_locations[:, 0].clamp(min=0, max=W - 1)
-            new_locations[:, 1] = new_locations[:, 1].clamp(min=0, max=H - 1)
-            new_locations_x = new_locations[:, 0] // int((W / grid_num))
-            new_locations_y = new_locations[:, 1] // int((H / grid_num))
+            new_locations = locations / 4.  # n, 2(x, y)
+            new_locations[:, 0] = new_locations[:, 0].clamp(min=0, max=2*W - 1)
+            new_locations[:, 1] = new_locations[:, 1].clamp(min=0, max=2*H - 1)
+            new_locations_x = new_locations[:, 0] // int((2*W / grid_num))
+            new_locations_y = new_locations[:, 1] // int((2*H / grid_num))
             new_locations_ind = (new_locations_x + grid_num * new_locations_y).to(torch.int64)
             if not self.concat or not len(locations):
                 return level_ind, new_locations_ind, i_weight, i_bias, None
             new_inside_locations = torch.zeros_like(new_locations)
-            new_inside_locations[:, 0] = new_locations[:, 0] % int((W / grid_num))
-            new_inside_locations[:, 1] = new_locations[:, 1] % int((H / grid_num))
-            new_locations_inside_x = new_inside_locations[:, 0] // round((W / (grid_num * grid_inside_num)) + 0.5)
-            new_locations_inside_y = new_inside_locations[:, 1] // round((H / (grid_num * grid_inside_num)) + 0.5)
+            new_inside_locations[:, 0] = new_locations[:, 0] % int((2*W / grid_num))
+            new_inside_locations[:, 1] = new_locations[:, 1] % int((2*H / grid_num))
+            new_locations_inside_x = new_inside_locations[:, 0] // round((2*W / (grid_num * grid_inside_num)) + 0.5)
+            new_locations_inside_y = new_inside_locations[:, 1] // round((2*H / (grid_num * grid_inside_num)) + 0.5)
             relative_inside_location = (new_locations_inside_x + grid_inside_num * new_locations_inside_y).to(
                 torch.int64)
             assert (relative_inside_location < grid_inside_num ** 2).all(), \
@@ -271,15 +271,12 @@ class DynamicMaskHead(nn.Module):
             param_ind = []
             gt_ind = []
             for idx, (ind, inside_ind) in enumerate(zip(new_locations_ind, relative_inside_location)):
-                final_locations_ind.append(ind)
-                param_ind.append(idx)
-                gt_ind.append(9*idx)
                 map = grid_map[inside_ind]
                 for inside_idx, (x, y) in enumerate(map):
                     if x < 100:
                         _x = new_locations_x[idx] + x
                         _y = new_locations_y[idx] + y
-                        if _x > 0 and _y > 0 and _x < grid_num and _y < grid_num:
+                        if _x >= 0 and _y >= 0 and _x < grid_num and _y < grid_num:
                             _ind = _x + grid_num * _y
                             final_locations_ind.append(_ind)
                             param_ind.append(idx)
@@ -310,9 +307,11 @@ class DynamicMaskHead(nn.Module):
         if not self.concat:
             mask_head_inputs2 = mask_head_inputs[ind2]
             mask_head_inputs4 = mask_head_inputs[ind4]
+            inds_list = [ind1, ind2, ind4]
         else:
             mask_head_inputs2 = mask_head_inputs[param_ind_2]
             mask_head_inputs4 = mask_head_inputs[param_ind_4]
+            inds_list = [(ind1, ind1), (ind2, param_ind_2), (ind4, param_ind_4)]
 
         n_inst1 = mask_head_inputs1.shape[0]
         n_inst2 = mask_head_inputs2.shape[0]
@@ -361,7 +360,7 @@ class DynamicMaskHead(nn.Module):
 
         mask_logits_list = [mask_logits1, mask_logits2, mask_logits4]
 
-        return mask_logits_list, gt_bitmasks_list, [ind1, ind2, ind4], [gt_ind_2, gt_ind_4]
+        return mask_logits_list, gt_bitmasks_list, inds_list, [None, gt_ind_2, gt_ind_4]
 
     def __call__(self, mask_feats, mask_feat_stride, pred_instances, gt_instances=None):
         if self.training:
@@ -436,8 +435,8 @@ class DynamicMaskHead(nn.Module):
         for idx, (c_x, c_y) in enumerate(zip(center_x_gt_boxes, center_y_gt_boxes)):
             i = c_x // (w / grid_num)
             j = c_y // (h / grid_num)
-            i_list = [i, ]
-            j_list = [j, ]
+            i_list = []
+            j_list = []
             inside_c_x = c_x % (w / grid_num)
             inside_c_y = c_y % (h / grid_num)
             inside_i = inside_c_x // round((w / (grid_num * grid_inside_num)) + 0.5)
@@ -449,7 +448,7 @@ class DynamicMaskHead(nn.Module):
                 if x < 100:
                     _x = i + x
                     _y = j + y
-                    if _x > 0 and _y > 0 and _x < grid_num and _y < grid_num:
+                    if _x >= 0 and _y >= 0 and _x < grid_num and _y < grid_num:
                         i_list.append(_x)
                         j_list.append(_y)
                         inside.append(inside_ind)
@@ -543,12 +542,13 @@ class DynamicMaskHead(nn.Module):
         pred_instances.pred_global_masks = pred_global_masks
         return pred_instances
 
-    def recover_ins2all_concat(self, mask_feats, mask_scores, pred_instances, inds, gt_inds):
+    def recover_ins2all_concat(self, mask_feats, mask_scores, pred_instances, inds, gt_inds, grid_inside_num=3):
         # 2grid 1map: 50x50 i_w: 100
         # 2grid 2map: 100x100
         _, _, H, W = mask_feats.shape
         device = mask_feats.device
         N = pred_instances.pred_boxes.tensor.shape[0]
+        locations = pred_instances.locations
         mask_scores_all = []
         for idx_all, mask_scores_per_level in enumerate(mask_scores):
             if mask_scores_per_level is None:
@@ -563,36 +563,55 @@ class DynamicMaskHead(nn.Module):
                 mask_scores_all.append(recover_mask_scores)
                 continue
             n, _, h, w = mask_scores_per_level.shape
-            pred_boxes = pred_instances.pred_boxes.tensor[inds[idx_all]]  # 1
+            # pred_boxes = pred_instances.pred_boxes.tensor[inds[idx_all]]  # 1
+            per_locations = locations[inds[idx_all][0]][inds[idx_all][1]].cpu().numpy() / 4.
             # resized_pred_boxes = pred_boxes / 4.
             if idx_all == 1:
-                i_h = h
-                i_w = w
-                resized_pred_boxes = pred_boxes / 4
-                max_h = 2 * h - 1
-                max_w = 2 * w - 1
+                i_h = H
+                i_w = W
+                # resized_pred_boxes = pred_boxes / 4
+                # max_h = 2 * h - 1
+                # max_w = 2 * w - 1
             elif idx_all == 2:
-                i_h = h
-                i_w = w
-                resized_pred_boxes = pred_boxes / 4
-                max_h = 4 * h - 1
-                max_w = 4 * w - 1
+                i_h = int(H / 2)
+                i_w = int(W/2)
+                # resized_pred_boxes = pred_boxes / 4
+                # max_h = 4 * h - 1
+                # max_w = 4 * w - 1
             else:
                 return 0
-            assert len(resized_pred_boxes.shape) == 2, resized_pred_boxes
-            center_x_pred_boxes = ((resized_pred_boxes[:, 2] + resized_pred_boxes[:, 0]) / 2.0).clamp(min=0, max=max_w)
-            center_y_pred_boxes = ((resized_pred_boxes[:, 3] + resized_pred_boxes[:, 1]) / 2.0).clamp(min=0, max=max_h)
-            center_x_pred_boxes = center_x_pred_boxes.tolist()
-            center_y_pred_boxes = center_y_pred_boxes.tolist()
-            assert len(center_x_pred_boxes) >= 1
-            assert len(center_y_pred_boxes) >= 1
+            # assert len(resized_pred_boxes.shape) == 2, resized_pred_boxes
+            # center_x_pred_boxes = ((resized_pred_boxes[:, 2] + resized_pred_boxes[:, 0]) / 2.0).clamp(min=0, max=max_w)
+            # center_y_pred_boxes = ((resized_pred_boxes[:, 3] + resized_pred_boxes[:, 1]) / 2.0).clamp(min=0, max=max_h)
+            # center_x_pred_boxes = center_x_pred_boxes.tolist()
+            # center_y_pred_boxes = center_y_pred_boxes.tolist()
+            # # print(per_locations / 4, center_x_pred_boxes, center_y_pred_boxes)
+            # assert len(center_x_pred_boxes) >= 1
+            # assert len(center_y_pred_boxes) >= 1
 
             recover_mask_scores = []
-            for idx, (c_x, c_y) in enumerate(zip(center_x_pred_boxes, center_y_pred_boxes)):
+            loc_map = {0: (0, 0),
+                       1: (-1, 0),
+                       2: (-1, -1),
+                       3: (0, -1),
+                       4: (1, -1),
+                       5: (1, 0),
+                       6: (1, 1),
+                       7: (0, 1),
+                       8: (-1, 1)}
+            # print(idx_all, per_locations[60], gt_inds[idx_all][60])
+            # for idx, (c_x, c_y, gt_ind_per_ins) in enumerate(zip(center_x_pred_boxes, center_y_pred_boxes, gt_inds[idx_all])):
+            for idx, (center, gt_ind_per_ins) in enumerate(zip(per_locations, gt_inds[idx_all])):
+                c_x, c_y = center
                 i = c_x // i_w
                 j = c_y // i_h
-                assert i < self.grid_num[idx_all], (i, c_x, i_w, w)
-                assert j < self.grid_num[idx_all], (j, c_y, i_h, h)
+                ins_id = int(gt_ind_per_ins // 9) + 1
+                loc_id = int(gt_ind_per_ins % 9)
+                delata = loc_map[loc_id]
+                i = i + delata[0]
+                j = j + delata[1]
+                assert i < self.grid_num[idx_all], (idx_all, idx, i, c_x, i_w, w, delata[0])
+                assert j < self.grid_num[idx_all], (idx_all, idx, j, c_y, i_h, h, delata[1])
                 w_l = int(i * i_w)  # 25x
                 w_r = int((self.grid_num[idx_all] - i - 1) * i_w)
                 h_u = int(j * i_h)
@@ -603,14 +622,20 @@ class DynamicMaskHead(nn.Module):
                     mode='bilinear',
                     align_corners=True
                 )
-                recover_mask_scores.append(recover_mask)
+                if ins_id > len(recover_mask_scores):
+                    recover_mask_scores.append(recover_mask)
+                else:
+                    recover_mask_scores[-1] = recover_mask_scores[-1] + recover_mask
             recover_mask_scores = torch.cat(recover_mask_scores)
             mask_scores_all.append(recover_mask_scores)
 
         pred_global_masks = torch.zeros([N, 1, 2 * H, 2 * W]).to(device=device)
+        n_ins = 0
         for ind, final_mask_scores_per_level in zip(inds, mask_scores_all):
             if final_mask_scores_per_level is not None:
-                pred_global_masks[ind] = final_mask_scores_per_level.float()
+                n_ins += final_mask_scores_per_level.shape[0]
+                pred_global_masks[ind[0]] = final_mask_scores_per_level.float()
+        # assert n_ins == N, (N, n_ins)
 
         pred_instances.pred_global_masks = pred_global_masks
         return pred_instances
