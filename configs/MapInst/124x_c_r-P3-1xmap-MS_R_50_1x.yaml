@@ -1,0 +1,14 @@
+_BASE_: "Base-MapInst.yaml"
+MODEL:
+  WEIGHTS: "detectron2://ImageNetPretrained/MSRA/R-50.pkl"
+  RESNETS:
+    DEPTH: 50
+  CONDINST:
+    MASK_HEAD:
+      USE_MULTI: True
+      DISABLE_REL_COORDS: False
+      MAPPING_RATIO: 1.0
+      GRID_NUM: [1, 2, 4]
+      SPLIT: [-1, 0, 2, 4]
+      CONCAT: True
+OUTPUT_DIR: "output/124x_c_r-P3-1xmap-mapinst_MS_R_50_1x"

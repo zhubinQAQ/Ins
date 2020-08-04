@@ -141,6 +141,8 @@ class DynamicMaskHead(nn.Module):
         self.grid_num = cfg.MODEL.CONDINST.MASK_HEAD.GRID_NUM
         self.split = cfg.MODEL.CONDINST.MASK_HEAD.SPLIT
         self.concat = cfg.MODEL.CONDINST.MASK_HEAD.CONCAT
+        self.loss_weights = cfg.MODEL.CONDINST.MASK_HEAD.LOSS_WEIGHTS
+
         assert isinstance(self.grid_num, list)
 
         weight_nums, bias_nums = [], []
@@ -207,12 +209,40 @@ class DynamicMaskHead(nn.Module):
                 x = F.relu(x)
         x = x.reshape(-1, 1, int(H / grid_num), int(W / grid_num))
         assert out_size is not None, num_insts
-        x = F.interpolate(
-            x, size=out_size,
-            mode='bilinear',
-            align_corners=True
-        )
+        if self.training:
+            x = aligned_bilinear(x, 2 * grid_num)
+            # x = F.interpolate(
+            #     x, size=out_size,
+            #     mode='bilinear',
+            #     align_corners=True
+            # )
+        else:
+            x = aligned_bilinear(x, 2)
+            # x = F.interpolate(
+            #     x, scale_factor=2,
+            #     mode='bilinear',
+            #     align_corners=True
+            # )
         return x
+
+    def add_locaions_info(self, locations, instances, mask_feats):
+        # 之前在fcos记录了每个pos location的中心位置，在这里生成相对坐标
+        # 即target所在的点变成0，其余的变成和它的相对距离
+        instance_locations = instances.locations
+        # (39, 1, 2) - (1, hxw, 2)
+        relative_coords = instance_locations.reshape(-1, 1, 2) - locations.reshape(1, -1, 2)
+        # (39, hxw, 2) --> (39, 2, hxw)
+        relative_coords = relative_coords.permute(0, 2, 1).float()
+        # 给每个相对距离乘以一个衰减系数，如果instance越大，即来自高层特征，
+        # 则会给它的相对距离更大的衰减因子
+        soi = self.sizes_of_interest.float()[instances.fpn_levels]
+        relative_coords = relative_coords / soi.reshape(-1, 1, 1)
+        relative_coords = relative_coords.to(dtype=mask_feats.dtype)
+
+        mask_feats = torch.cat([
+            relative_coords, mask_feats
+        ], dim=1)
+        return mask_feats
 
     def mask_heads_forward_with_coords(
             self, mask_feats, mask_feat_stride, instances, gt_instances=None
@@ -238,8 +268,16 @@ class DynamicMaskHead(nn.Module):
 
         N, _, H, W = mask_feats.size()
         num_layers = self.num_layers
-        mask_head_inputs = mask_feats[im_inds].reshape(n_inst, self.in_channels, H * W).reshape(n_inst,
-                                                                                                self.in_channels, H, W)
+        mask_head_inputs = mask_feats[im_inds].reshape(n_inst, self.in_channels, H * W)
+        if not self.disable_rel_coords:
+            base_locations = compute_locations(
+                mask_feats.size(2), mask_feats.size(3),
+                stride=mask_feat_stride, device=mask_feats.device
+            )
+            mask_head_inputs = self.add_locaions_info(base_locations, instances, mask_head_inputs)
+            mask_head_inputs = mask_head_inputs.reshape(n_inst, self.in_channels + 2, H, W)
+        else:
+            mask_head_inputs = mask_head_inputs.reshape(n_inst, self.in_channels, H, W)
 
         def get_loaction_weights_bias(level_ind, locations, i_weight, i_bias, grid_num=4, grid_inside_num=3):
             new_locations = locations / 4.  # n, 2(x, y)
@@ -278,28 +316,6 @@ class DynamicMaskHead(nn.Module):
             param_ind = param_ind[param_ind > 0] - 1
             param_ind = param_ind.to(dtype=torch.int64, device=mask_feats.device)
             gt_ind = torch.arange(0, n*9)[ind_valid].to(dtype=torch.int64, device=mask_feats.device)
-            # print(n, final_locations_ind, param_ind, gt_ind)
-            # final_locations_ind = []
-            # param_ind = []
-            # gt_ind = []
-            # base_range = torch.arange(0, 9).to(device=mask_feats.device)
-            # relative_inside_location = relative_inside_location.cpu().numpy()
-            # for idx, inside_ind in enumerate(relative_inside_location):
-            #     map = grid_map[inside_ind].clone()
-            #     map[:, 0] = map[:, 0] + new_locations_x[idx]
-            #     map[:, 1] = map[:, 1] + new_locations_y[idx]
-            #     ind_valid = (map[:, 0] >= 0) & (map[:, 0] < grid_num) & (map[:, 1] >= 0) & (map[:, 1] < grid_num)
-            #     map = map[ind_valid]
-            #     final_locations_ind.extend((map[:, 0] + grid_num * map[:, 1]).tolist())
-            #     assert len(map) >= 1, (map, grid_map[inside_ind], new_locations_x[idx])
-            #     param_ind.extend([idx] * len(map))
-            #     gt_ind.extend((9 * idx + base_range[ind_valid]).tolist())
-            # # time3 = time.time()
-            # gt_ind = torch.as_tensor(gt_ind).to(dtype=torch.int64, device=mask_feats.device)
-            # param_ind = torch.as_tensor(param_ind).to(dtype=torch.int64, device=mask_feats.device)
-            # final_locations_ind = torch.as_tensor(final_locations_ind).to(dtype=torch.int64, device=mask_feats.device)
-            # print(final_locations_ind, param_ind, gt_ind)
-            # print(zhubin)
             if not len(param_ind):
                 return level_ind, new_locations_ind, i_weight, i_bias, None
             for l in range(num_layers):
@@ -338,20 +354,24 @@ class DynamicMaskHead(nn.Module):
             gt_bitmasks = torch.cat([per_im.gt_bitmasks for per_im in gt_instances])  # 1/4
             gt_boxes = torch.cat([per_im.gt_boxes.tensor for per_im in gt_instances])  # 1
 
-            gt_inds1 = gt_inds[ind1]
-            crop_gt_bitmasks1, out_size1 = self.crop_and_expand(gt_bitmasks, gt_boxes, grid_num=self.grid_num[0])
-            gt_bitmasks1 = crop_gt_bitmasks1[gt_inds1].unsqueeze(dim=1).to(dtype=mask_feats.dtype)
-
-            gt_inds2 = gt_inds[ind2]
-            gt_inds4 = gt_inds[ind4]
             if not self.concat:
+                gt_inds1 = gt_inds[ind1]
+                crop_gt_bitmasks1, out_size1 = self.crop_and_expand(gt_bitmasks, gt_boxes, grid_num=self.grid_num[0])
+                gt_bitmasks1 = crop_gt_bitmasks1[gt_inds1].unsqueeze(dim=1).to(dtype=mask_feats.dtype)
+                gt_inds2 = gt_inds[ind2]
                 crop_gt_bitmasks2, out_size2 = self.crop_and_expand(gt_bitmasks, gt_boxes, grid_num=self.grid_num[1])
+                gt_inds4 = gt_inds[ind4]
                 crop_gt_bitmasks4, out_size4 = self.crop_and_expand(gt_bitmasks, gt_boxes, grid_num=self.grid_num[2])
                 gt_bitmasks2 = crop_gt_bitmasks2[gt_inds2]
                 gt_bitmasks4 = crop_gt_bitmasks4[gt_inds4]
             else:
+                gt_inds1 = gt_inds[ind1]
+                crop_gt_bitmasks1, out_size1 = self.crop_and_expand_concate(gt_bitmasks, gt_boxes, grid_num=self.grid_num[0])
+                gt_bitmasks1 = crop_gt_bitmasks1[gt_inds1].unsqueeze(dim=1).to(dtype=mask_feats.dtype)
                 crop_gt_bitmasks2 = self.crop_and_expand_concate(gt_bitmasks, gt_boxes, grid_num=self.grid_num[1])
                 crop_gt_bitmasks4 = self.crop_and_expand_concate(gt_bitmasks, gt_boxes, grid_num=self.grid_num[2])
+                gt_inds2 = gt_inds[ind2]
+                gt_inds4 = gt_inds[ind4]
                 gt_bitmasks2 = [crop_gt_bitmasks2[ind] for ind in gt_inds2.tolist()]
                 gt_bitmasks4 = [crop_gt_bitmasks4[ind] for ind in gt_inds4.tolist()]
                 gt_bitmasks2 = torch.cat(gt_bitmasks2)[gt_ind_2] if len(gt_inds2) else None
@@ -366,13 +386,17 @@ class DynamicMaskHead(nn.Module):
             out_size1 = (int(H * 2), int(W * 2))
             out_size2 = (H, W)
             out_size4 = (int(H / 2), int(W / 2))
+            # out_size1 = (int(H * 2), int(W * 2))
+            # out_size2 = (int(H * 2), int(W * 2))
+            # out_size4 = (int(H * 2), int(W * 2))
+        out_size = {1: out_size1, 2: out_size2, 4: out_size4}
 
         mask_logits1 = self.mask_heads_forward(
-            mask_head_inputs1, out_size1, weights[0], biases[0], n_inst1, [], self.grid_num[0])
+            mask_head_inputs1, out_size[self.grid_num[0]], weights[0], biases[0], n_inst1, [], self.grid_num[0])
         mask_logits2 = self.mask_heads_forward(
-            mask_head_inputs2, out_size2, weights[1], biases[1], n_inst2, new_ind2, self.grid_num[1])
+            mask_head_inputs2, out_size[self.grid_num[1]], weights[1], biases[1], n_inst2, new_ind2, self.grid_num[1])
         mask_logits4 = self.mask_heads_forward(
-            mask_head_inputs4, out_size4, weights[2], biases[2], n_inst4, new_ind4, self.grid_num[2])
+            mask_head_inputs4, out_size[self.grid_num[2]], weights[2], biases[2], n_inst4, new_ind4, self.grid_num[2])
 
         mask_logits_list = [mask_logits1, mask_logits2, mask_logits4]
 
@@ -387,14 +411,18 @@ class DynamicMaskHead(nn.Module):
                     mask_feats, mask_feat_stride, pred_instances, gt_instances
                 )
                 losses = []
+                norm = 0
                 for i, (mask_scores_per_level, gt_bitmasks_per_level) in enumerate(zip(mask_scores, gt_bitmasks)):
                     if mask_scores_per_level is not None:
                         assert gt_bitmasks_per_level is not None
+                        w = self.loss_weights[i]
+                        norm += w
                         mask_scores_per_level = mask_scores_per_level.sigmoid()
                         mask_losses = dice_coefficient(mask_scores_per_level, gt_bitmasks_per_level)
-                        loss_mask = mask_losses.mean()
+                        loss_mask = w * mask_losses.mean()
                         losses.append(loss_mask)
-                loss_mask = sum(losses) / len(losses)
+                assert norm > 0
+                loss_mask = sum(losses) / norm
             return loss_mask.float()
         else:
             if len(pred_instances) > 0:
@@ -436,115 +464,155 @@ class DynamicMaskHead(nn.Module):
         return expand_gt_bitmasks, expand_gt_bitmasks.shape[1:]
 
     def crop_and_expand_concate(self, gt_bitmasks, gt_boxes, grid_num=4, grid_inside_num=3, mapping_ratio=1.0):
-        if grid_num == 1:
-            return gt_bitmasks, gt_bitmasks.shape[1:]
-        resized_gt_boxes = gt_boxes / 4.
-        center_x_gt_boxes = ((resized_gt_boxes[:, 2] + resized_gt_boxes[:, 0]) / 2.0).squeeze().cpu().numpy()
-        center_y_gt_boxes = ((resized_gt_boxes[:, 3] + resized_gt_boxes[:, 1]) / 2.0).squeeze().cpu().numpy()
-        n, h, w = gt_bitmasks.shape
-        device = gt_bitmasks.device
-        h_i = int(h / (2 * grid_num))  # 4: pad 25 2: pad 50
-        w_i = int(w / (2 * grid_num))
-        pad_gt_bitmasks = F.pad(gt_bitmasks, [w_i, w_i, h_i, h_i], mode='constant', value=0)
-        expand_gt_bitmasks = []
-        # grid_map = torch.from_numpy(get_grid_map(grid_inside_num)).to(device=device)
-        grid_map = get_grid_map(grid_inside_num)
-        for idx, (c_x, c_y) in enumerate(zip(center_x_gt_boxes, center_y_gt_boxes)):
-            i = c_x // (w / grid_num)
-            j = c_y // (h / grid_num)
-            i_list = []
-            j_list = []
-            inside_c_x = c_x % (w / grid_num)
-            inside_c_y = c_y % (h / grid_num)
-            inside_i = inside_c_x // round((w / (grid_num * grid_inside_num)) + 0.5)
-            inside_j = inside_c_y // round((h / (grid_num * grid_inside_num)) + 0.5)
-            inside_ind = int(inside_i + grid_inside_num * inside_j)
-            map = grid_map[inside_ind]
-            # map[:, 0] = map[:, 0] + i
-            # map[:, 1] = map[:, 1] + j
-            # valid_ind = (map[:, 0] >=0) & (map[:, 0] < grid_num) & (map[:, 1] >=0) & (map[:, 1] < grid_num)
-            # map = map[valid_ind]
-            # inside = torch.arange(0, 9)[valid_ind].tolist()
-            inside = []
-            for i_inside_ind, (x, y) in enumerate(map):
-                if x < 100:
-                    _x = i + x
-                    _y = j + y
-                    if _x >= 0 and _y >= 0 and _x < grid_num and _y < grid_num:
-                        i_list.append(_x)
-                        j_list.append(_y)
-                        inside.append(i_inside_ind)
-            expand_gt_bitmasks_per_ins = torch.zeros(9, 2*h_i, 2*w_i).to(dtype=torch.float32, device=device)
-            # per_c_x = w_i + (map[:, 0] * 2 + 1) * w_i
-            # per_c_y = h_i + (map[:, 1] * 2 + 1) * h_i
-            # x1 = per_c_x - mapping_ratio * w_i
-            # x2 = per_c_x + mapping_ratio * w_i
-            # y1 = per_c_y - mapping_ratio * h_i
-            # y2 = per_c_y + mapping_ratio * h_i
-            # for per, per_inside in enumerate(inside):
-            #     expand_gt_bitmasks_per_ins[per_inside] = \
-            #         pad_gt_bitmasks[idx, int(y1[per]):int(y2[per]), int(x1[per]):int(x2[per])]
-            for per_i, per_j, per_inside in zip(i_list, j_list, inside):
-                assert per_i < grid_num, per_i
-                assert per_j < grid_num, per_j
-                per_c_x = w_i + (per_i * 2 + 1) * w_i
-                per_c_y = h_i + (per_j * 2 + 1) * h_i
-                x1 = int(per_c_x - mapping_ratio * w_i)
-                x2 = int(per_c_x + mapping_ratio * w_i)
-                y1 = int(per_c_y - mapping_ratio * h_i)
-                y2 = int(per_c_y + mapping_ratio * h_i)
-                expand_gt_bitmasks_per_ins[per_inside] = pad_gt_bitmasks[idx, y1:y2, x1:x2]
-            expand_gt_bitmasks.append(expand_gt_bitmasks_per_ins)
-        return expand_gt_bitmasks
+        if self.mask_out_stride > 1:
+            if grid_num == 1:
+                return gt_bitmasks, gt_bitmasks.shape[1:]
+            resized_gt_boxes = gt_boxes / 4.
+            center_x_gt_boxes = ((resized_gt_boxes[:, 2] + resized_gt_boxes[:, 0]) / 2.0).squeeze().cpu().numpy()
+            center_y_gt_boxes = ((resized_gt_boxes[:, 3] + resized_gt_boxes[:, 1]) / 2.0).squeeze().cpu().numpy()
+            n, h, w = gt_bitmasks.shape
+            device = gt_bitmasks.device
+            h_i = int(h / (2 * grid_num))  # 4: pad 25 2: pad 50
+            w_i = int(w / (2 * grid_num))
+            pad_gt_bitmasks = F.pad(gt_bitmasks, [w_i, w_i, h_i, h_i], mode='constant', value=0)
+            expand_gt_bitmasks = []
+            # grid_map = torch.from_numpy(get_grid_map(grid_inside_num)).to(device=device)
+            grid_map = get_grid_map(grid_inside_num)
+            for idx, (c_x, c_y) in enumerate(zip(center_x_gt_boxes, center_y_gt_boxes)):
+                i = c_x // (w / grid_num)
+                j = c_y // (h / grid_num)
+                i_list = []
+                j_list = []
+                inside_c_x = c_x % (w / grid_num)
+                inside_c_y = c_y % (h / grid_num)
+                inside_i = inside_c_x // round((w / (grid_num * grid_inside_num)) + 0.5)
+                inside_j = inside_c_y // round((h / (grid_num * grid_inside_num)) + 0.5)
+                inside_ind = int(inside_i + grid_inside_num * inside_j)
+                map = grid_map[inside_ind]
+                # map[:, 0] = map[:, 0] + i
+                # map[:, 1] = map[:, 1] + j
+                # valid_ind = (map[:, 0] >=0) & (map[:, 0] < grid_num) & (map[:, 1] >=0) & (map[:, 1] < grid_num)
+                # map = map[valid_ind]
+                # inside = torch.arange(0, 9)[valid_ind].tolist()
+                inside = []
+                for i_inside_ind, (x, y) in enumerate(map):
+                    if x < 100:
+                        _x = i + x
+                        _y = j + y
+                        if _x >= 0 and _y >= 0 and _x < grid_num and _y < grid_num:
+                            i_list.append(_x)
+                            j_list.append(_y)
+                            inside.append(i_inside_ind)
+                expand_gt_bitmasks_per_ins = torch.zeros(9, 2*h_i, 2*w_i).to(dtype=torch.float32, device=device)
+                # per_c_x = w_i + (map[:, 0] * 2 + 1) * w_i
+                # per_c_y = h_i + (map[:, 1] * 2 + 1) * h_i
+                # x1 = per_c_x - mapping_ratio * w_i
+                # x2 = per_c_x + mapping_ratio * w_i
+                # y1 = per_c_y - mapping_ratio * h_i
+                # y2 = per_c_y + mapping_ratio * h_i
+                # for per, per_inside in enumerate(inside):
+                #     expand_gt_bitmasks_per_ins[per_inside] = \
+                #         pad_gt_bitmasks[idx, int(y1[per]):int(y2[per]), int(x1[per]):int(x2[per])]
+                for per_i, per_j, per_inside in zip(i_list, j_list, inside):
+                    assert per_i < grid_num, per_i
+                    assert per_j < grid_num, per_j
+                    per_c_x = w_i + (per_i * 2 + 1) * w_i
+                    per_c_y = h_i + (per_j * 2 + 1) * h_i
+                    x1 = int(per_c_x - mapping_ratio * w_i)
+                    x2 = int(per_c_x + mapping_ratio * w_i)
+                    y1 = int(per_c_y - mapping_ratio * h_i)
+                    y2 = int(per_c_y + mapping_ratio * h_i)
+                    expand_gt_bitmasks_per_ins[per_inside] = pad_gt_bitmasks[idx, y1:y2, x1:x2]
+                expand_gt_bitmasks.append(expand_gt_bitmasks_per_ins)
+            return expand_gt_bitmasks
+        else:
+            # gt_bitmasks = F.interpolate(
+            #     gt_bitmasks.unsqueeze(0), scale_factor=0.25 * grid_num,
+            #     mode='bilinear',
+            #     align_corners=True
+            # ).squeeze(0)
+            stride = 4 / grid_num
+            start = int(stride // 2)
+            gt_bitmasks = gt_bitmasks[:, start::stride, start::stride]
+            if grid_num == 1:
+                return gt_bitmasks, gt_bitmasks.shape[1:]
+            # 2: 0.5  4: 1
+            resized_gt_boxes = gt_boxes * (0.25 * grid_num)
+            center_x_gt_boxes = ((resized_gt_boxes[:, 2] + resized_gt_boxes[:, 0]) / 2.0).squeeze().cpu().numpy()
+            center_y_gt_boxes = ((resized_gt_boxes[:, 3] + resized_gt_boxes[:, 1]) / 2.0).squeeze().cpu().numpy()
+            n, h, w = gt_bitmasks.shape
+            device = gt_bitmasks.device
+            h_i = int(h / (2 * grid_num))  # 4: pad 25 2: pad 50
+            w_i = int(w / (2 * grid_num))
+            pad_gt_bitmasks = F.pad(gt_bitmasks, [w_i, w_i, h_i, h_i], mode='constant', value=0)
+            expand_gt_bitmasks = []
+            grid_map = get_grid_map(grid_inside_num)
+            for idx, (c_x, c_y) in enumerate(zip(center_x_gt_boxes, center_y_gt_boxes)):
+                i = c_x // (w / grid_num)
+                j = c_y // (h / grid_num)
+                i_list = []
+                j_list = []
+                inside_c_x = c_x % (w / grid_num)
+                inside_c_y = c_y % (h / grid_num)
+                inside_i = inside_c_x // round((w / (grid_num * grid_inside_num)) + 0.5)
+                inside_j = inside_c_y // round((h / (grid_num * grid_inside_num)) + 0.5)
+                inside_ind = int(inside_i + grid_inside_num * inside_j)
+                map = grid_map[inside_ind]
+                inside = []
+                for i_inside_ind, (x, y) in enumerate(map):
+                    if x < 100:
+                        _x = i + x
+                        _y = j + y
+                        if _x >= 0 and _y >= 0 and _x < grid_num and _y < grid_num:
+                            i_list.append(_x)
+                            j_list.append(_y)
+                            inside.append(i_inside_ind)
+                expand_gt_bitmasks_per_ins = torch.zeros(9, 2 * h_i, 2 * w_i).to(dtype=torch.float32, device=device)
+                for per_i, per_j, per_inside in zip(i_list, j_list, inside):
+                    assert per_i < grid_num, per_i
+                    assert per_j < grid_num, per_j
+                    per_c_x = w_i + (per_i * 2 + 1) * w_i
+                    per_c_y = h_i + (per_j * 2 + 1) * h_i
+                    x1 = int(per_c_x - mapping_ratio * w_i)
+                    x2 = int(per_c_x + mapping_ratio * w_i)
+                    y1 = int(per_c_y - mapping_ratio * h_i)
+                    y2 = int(per_c_y + mapping_ratio * h_i)
+                    expand_gt_bitmasks_per_ins[per_inside] = pad_gt_bitmasks[idx, y1:y2, x1:x2]
+                expand_gt_bitmasks.append(expand_gt_bitmasks_per_ins)
+            return expand_gt_bitmasks
 
     def recover_ins2all(self, mask_feats, mask_scores, pred_instances, inds):
-        # 2grid 1map: 50x50 i_w: 100
-        # 2grid 2map: 100x100
         _, _, H, W = mask_feats.shape
         device = mask_feats.device
         N = pred_instances.pred_boxes.tensor.shape[0]
+        locations = pred_instances.locations
         mask_scores_all = []
+        # 1: 200 -> 800
+        # 2: 200 -> 400 -> 800
+        # 4: 200 -> 800 -> 800
         for idx_all, mask_scores_per_level in enumerate(mask_scores):
             if mask_scores_per_level is None:
                 mask_scores_all.append(None)
                 continue
-            if idx_all == 0:
-                recover_mask_scores = F.interpolate(
-                    mask_scores_per_level, size=(2 * H, 2 * W),
-                    mode='bilinear',
-                    align_corners=True
-                )
-                mask_scores_all.append(recover_mask_scores)
+            if idx_all == 0 or self.grid_num[idx_all] == 1:
+                mask_scores_all.append(mask_scores_per_level)
                 continue
             n, _, h, w = mask_scores_per_level.shape
-            pred_boxes = pred_instances.pred_boxes.tensor[inds[idx_all]]  # 1
-            # resized_pred_boxes = pred_boxes / 4.
             if idx_all == 1:
-                i_h = h
-                i_w = w
-                resized_pred_boxes = pred_boxes / 4
-                max_h = 2 * h - 1
-                max_w = 2 * w - 1
+                i_h = H
+                i_w = W
             elif idx_all == 2:
-                i_h = h
-                i_w = w
-                resized_pred_boxes = pred_boxes / 4
-                max_h = 4 * h - 1
-                max_w = 4 * w - 1
+                i_h = int(H / 2)
+                i_w = int(W / 2)
             else:
                 return 0
-            assert len(resized_pred_boxes.shape) == 2, resized_pred_boxes
-            center_x_pred_boxes = ((resized_pred_boxes[:, 2] + resized_pred_boxes[:, 0]) / 2.0).clamp(min=0, max=max_w)
-            center_y_pred_boxes = ((resized_pred_boxes[:, 3] + resized_pred_boxes[:, 1]) / 2.0).clamp(min=0, max=max_h)
-            center_x_pred_boxes = center_x_pred_boxes.tolist()
-            center_y_pred_boxes = center_y_pred_boxes.tolist()
-            assert len(center_x_pred_boxes) >= 1
-            assert len(center_y_pred_boxes) >= 1
 
             recover_mask_scores = []
-            for idx, (c_x, c_y) in enumerate(zip(center_x_pred_boxes, center_y_pred_boxes)):
-                i = c_x // i_w
-                j = c_y // i_h
+            per_locations = locations[inds[idx_all]].cpu().numpy() / 4.
+            for idx, center in enumerate(per_locations):
+                c_x, c_y = center
+                i = (c_x - 0.5) // i_w
+                j = (c_y - 0.5) // i_h
                 assert i < self.grid_num[idx_all], (i, c_x, i_w, w)
                 assert j < self.grid_num[idx_all], (j, c_y, i_h, h)
                 w_l = int(i * i_w)  # 25x
@@ -552,15 +620,6 @@ class DynamicMaskHead(nn.Module):
                 h_u = int(j * i_h)
                 h_d = int((self.grid_num[idx_all] - j - 1) * i_h)
                 recover_mask = F.pad(mask_scores_per_level[idx], [w_l, w_r, h_u, h_d], mode='constant', value=0)
-                # _, _h, _w = recover_mask.shape
-                # x_s = (self.mapping_ratio - 1) * (i_w / 2)
-                # y_s = (self.mapping_ratio - 1) * (i_h / 2)
-                # recover_mask = recover_mask[:, int(y_s):int(_h - y_s), int(x_s):int(_w - x_s)]
-                recover_mask = F.interpolate(
-                    recover_mask.unsqueeze(0), size=(2 * H, 2 * W),
-                    mode='bilinear',
-                    align_corners=True
-                )
                 recover_mask_scores.append(recover_mask)
             recover_mask_scores = torch.cat(recover_mask_scores)
             mask_scores_all.append(recover_mask_scores)
@@ -574,6 +633,116 @@ class DynamicMaskHead(nn.Module):
         return pred_instances
 
     def recover_ins2all_concat(self, mask_feats, mask_scores, pred_instances, inds, gt_inds, grid_inside_num=3):
+        _, _, H, W = mask_feats.shape
+        device = mask_feats.device
+        N = pred_instances.pred_boxes.tensor.shape[0]
+        locations = pred_instances.locations
+        mask_scores_all = []
+        # 1: 200 -> 800
+        # 2: 200 -> 400 -> 800
+        # 2: 200 -> 800 -> 800
+        for idx_all, mask_scores_per_level in enumerate(mask_scores):
+            if mask_scores_per_level is None:
+                mask_scores_all.append(None)
+                continue
+            if idx_all == 0:
+                # mask_scores_per_level = F.interpolate(
+                #     mask_scores_per_level, scale_factor=int(4 / self.grid_num[idx_all]),
+                #     mode='bilinear',
+                #     align_corners=True
+                # )
+                # mask_scores_per_level = aligned_bilinear(mask_scores_per_level, 4)
+                mask_scores_all.append(mask_scores_per_level)
+                continue
+            n, _, h, w = mask_scores_per_level.shape
+            per_locations = locations[inds[idx_all][0]][inds[idx_all][1]].cpu().numpy() / 4.
+            pred_boxes = pred_instances.pred_boxes.tensor[inds[idx_all][0]][
+                             inds[idx_all][1]].cpu().numpy() / 4.  # 1
+            if idx_all == 1:
+                i_h = H
+                i_w = W
+            elif idx_all == 2:
+                i_h = int(H / 2)
+                i_w = int(W / 2)
+            else:
+                return 0
+            # if idx_all == 1:
+            #     per_locations = locations[inds[idx_all][0]][inds[idx_all][1]].cpu().numpy() / 2.
+            #     pred_boxes = pred_instances.pred_boxes.tensor[inds[idx_all][0]][
+            #                      inds[idx_all][1]].cpu().numpy() / 2.  # 1
+            #     i_h = 2 * H
+            #     i_w = 2 * W
+            # elif idx_all == 2:
+            #     per_locations = locations[inds[idx_all][0]][inds[idx_all][1]].cpu().numpy()
+            #     pred_boxes = pred_instances.pred_boxes.tensor[inds[idx_all][0]][
+            #                      inds[idx_all][1]].cpu().numpy()
+            #     i_h = 2 * H
+            #     i_w = 2 * W
+            # else:
+            #     return 0
+
+            loc_map = {0: (0, 0),
+                       1: (-1, 0),
+                       2: (-1, -1),
+                       3: (0, -1),
+                       4: (1, -1),
+                       5: (1, 0),
+                       6: (1, 1),
+                       7: (0, 1),
+                       8: (-1, 1)}
+
+            recover_mask_scores = []
+            for idx, (box, center, gt_ind_per_ins) in enumerate(zip(pred_boxes, per_locations, gt_inds[idx_all])):
+                c_x, c_y = center
+                i = c_x // i_w
+                j = c_y // i_h
+                ins_id = int(gt_ind_per_ins // 9) + 1
+                loc_id = int(gt_ind_per_ins % 9)
+                delata = loc_map[loc_id]
+                i = i + delata[0]
+                j = j + delata[1]
+                assert i < self.grid_num[idx_all], (idx_all, idx, i, c_x, i_w, w, delata[0])
+                assert j < self.grid_num[idx_all], (idx_all, idx, j, c_y, i_h, h, delata[1])
+                w_l = int(i * i_w)  # 25x
+                w_r = int((self.grid_num[idx_all] - i - 1) * i_w)
+                h_u = int(j * i_h)
+                h_d = int((self.grid_num[idx_all] - j - 1) * i_h)
+                recover_mask = F.pad(mask_scores_per_level[idx], [w_l, w_r, h_u, h_d], mode='constant', value=0).unsqueeze(0)
+                clean_mask = torch.zeros_like(recover_mask)
+                _, _, r_h, r_w = clean_mask.shape
+                delta = 0
+                x1 = max(0, box[0] - delta)
+                x2 = min(r_w - 1, box[2] + delta)
+                y1 = max(0, box[1] - delta)
+                y2 = min(r_h - 1, box[3] + delta)
+                clean_mask[:, :, int(y1):int(y2), int(x1):int(x2)] = 1
+                recover_mask = recover_mask * clean_mask
+                if ins_id > len(recover_mask_scores):
+                    recover_mask_scores.append(recover_mask)
+                else:
+                    recover_mask_scores[-1] = recover_mask_scores[-1] + recover_mask
+            recover_mask_scores = torch.cat(recover_mask_scores)
+            # if idx_all == 1:
+            #     recover_mask_scores = F.interpolate(
+            #         recover_mask_scores, scale_factor=2,
+            #         mode='bilinear',
+            #         align_corners=True
+            #     )
+                # recover_mask_scores = aligned_bilinear(recover_mask_scores, 2)
+            mask_scores_all.append(recover_mask_scores)
+
+        pred_global_masks = torch.zeros([N, 1, 2 * H, 2 * W]).to(device=device)
+        n_ins = 0
+        for ind, final_mask_scores_per_level in zip(inds, mask_scores_all):
+            if final_mask_scores_per_level is not None:
+                n_ins += final_mask_scores_per_level.shape[0]
+                pred_global_masks[ind[0]] = final_mask_scores_per_level.float()
+        assert n_ins == N, (N, n_ins)
+
+        pred_instances.pred_global_masks = pred_global_masks
+        return pred_instances
+
+    def recover_ins2all_concat_old(self, mask_feats, mask_scores, pred_instances, inds, gt_inds, grid_inside_num=3):
         # 2grid 1map: 50x50 i_w: 100
         # 2grid 2map: 100x100
         _, _, H, W = mask_feats.shape
@@ -645,8 +814,10 @@ class DynamicMaskHead(nn.Module):
                        7: (0, 1),
                        8: (-1, 1)}
             per_locations = locations[inds[idx_all][0]][inds[idx_all][1]].cpu().numpy() / 4.
+            pred_boxes = pred_instances.pred_boxes.tensor[inds[idx_all][0]][inds[idx_all][1]].cpu().numpy() / 4.  # 1
+
             recover_mask_scores = []
-            for idx, (center, gt_ind_per_ins) in enumerate(zip(per_locations, gt_inds[idx_all])):
+            for idx, (box, center, gt_ind_per_ins) in enumerate(zip(pred_boxes, per_locations, gt_inds[idx_all])):
                 c_x, c_y = center
                 i = c_x // i_w
                 j = c_y // i_h
@@ -662,6 +833,9 @@ class DynamicMaskHead(nn.Module):
                 h_u = int(j * i_h)
                 h_d = int((self.grid_num[idx_all] - j - 1) * i_h)
                 recover_mask = F.pad(mask_scores_per_level[idx], [w_l, w_r, h_u, h_d], mode='constant', value=0).unsqueeze(0)
+                clean_mask = torch.zeros_like(recover_mask)
+                clean_mask[:, :, int(box[1]):int(box[3]), int(box[0]):int(box[2])] = 1
+                recover_mask = recover_mask * clean_mask
                 if ins_id > len(recover_mask_scores):
                     recover_mask_scores.append(recover_mask)
                 else:

@@ -193,7 +193,7 @@ class DynamicMaskHead(nn.Module):
                 )
                 # 全图大小的loss， 1/4下采样
                 # torch.Size([42, 1, 200, 296]) torch.Size([42, 1, 200, 296])
-                self.collect(mask_scores, gt_bitmasks)
+                # self.collect(mask_scores, gt_bitmasks)
                 mask_losses = dice_coefficient(mask_scores, gt_bitmasks)
                 loss_mask = mask_losses.mean()
 

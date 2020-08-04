@@ -38,7 +38,7 @@ class CondInst(nn.Module):
             from .dynamic_mask_head_multi import build_dynamic_mask_head
             self.mask_head = build_dynamic_mask_head(cfg)
         else:
-            from .dynamic_mask_head import build_dynamic_mask_head
+            from .dynamic_mask_head_old import build_dynamic_mask_head
             self.mask_head = build_dynamic_mask_head(cfg)
         self.mask_branch = build_mask_branch(cfg, self.backbone.output_shape())
         self.mask_out_stride = cfg.MODEL.CONDINST.MASK_OUT_STRIDE
@@ -201,6 +201,17 @@ class CondInst(nn.Module):
             pred_global_masks = aligned_bilinear(
                 results.pred_global_masks, factor
             )
+            # print(mask_h, mask_w, factor_h, factor_w, padded_im_h, padded_im_w, pred_global_masks.shape)
+            # print(zhubin)
+            # assert factor > 1, factor
+            # if factor > 1:
+            #     pred_global_masks = F.interpolate(
+            #         results.pred_global_masks,
+            #         scale_factor=factor,
+            #         mode="bilinear", align_corners=True
+            #     )
+            # else:
+            #     pred_global_masks = results.pred_global_masks
             pred_global_masks = pred_global_masks[:, :, :resized_im_h, :resized_im_w]
             pred_global_masks = F.interpolate(
                 pred_global_masks,
