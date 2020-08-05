@@ -80,7 +80,12 @@ class MaskBranch(nn.Module):
                 assert target_w % w == 0
                 factor_h, factor_w = target_h // h, target_w // w
                 assert factor_h == factor_w
-                x_p = aligned_bilinear(x_p, factor_h)
+                x_p = F.interpolate(
+                    x_p, scale_factor=factor_h,
+                    mode='bilinear',
+                    align_corners=True
+                )
+                # x_p = aligned_bilinear(x_p, factor_h)
                 x = x + x_p
 
         mask_feats = self.tower(x)

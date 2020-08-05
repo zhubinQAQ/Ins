@@ -210,19 +210,19 @@ class DynamicMaskHead(nn.Module):
         x = x.reshape(-1, 1, int(H / grid_num), int(W / grid_num))
         assert out_size is not None, num_insts
         if self.training:
-            x = aligned_bilinear(x, 2 * grid_num)
-            # x = F.interpolate(
-            #     x, size=out_size,
-            #     mode='bilinear',
-            #     align_corners=True
-            # )
+            # x = aligned_bilinear(x, 2 * grid_num)
+            x = F.interpolate(
+                x, size=out_size,
+                mode='bilinear',
+                align_corners=True
+            )
         else:
-            x = aligned_bilinear(x, 2)
-            # x = F.interpolate(
-            #     x, scale_factor=2,
-            #     mode='bilinear',
-            #     align_corners=True
-            # )
+            # x = aligned_bilinear(x, 2)
+            x = F.interpolate(
+                x, scale_factor=2,
+                mode='bilinear',
+                align_corners=True
+            )
         return x
 
     def add_locaions_info(self, locations, instances, mask_feats):
@@ -526,14 +526,14 @@ class DynamicMaskHead(nn.Module):
                 expand_gt_bitmasks.append(expand_gt_bitmasks_per_ins)
             return expand_gt_bitmasks
         else:
-            # gt_bitmasks = F.interpolate(
-            #     gt_bitmasks.unsqueeze(0), scale_factor=0.25 * grid_num,
-            #     mode='bilinear',
-            #     align_corners=True
-            # ).squeeze(0)
-            stride = 4 / grid_num
-            start = int(stride // 2)
-            gt_bitmasks = gt_bitmasks[:, start::stride, start::stride]
+            gt_bitmasks = F.interpolate(
+                gt_bitmasks.unsqueeze(0), scale_factor=0.25 * grid_num,
+                mode='bilinear',
+                align_corners=True
+            ).squeeze(0)
+            # stride = int(4 / grid_num)
+            # start = int(stride // 2)
+            # gt_bitmasks = gt_bitmasks[:, start::stride, start::stride]
             if grid_num == 1:
                 return gt_bitmasks, gt_bitmasks.shape[1:]
             # 2: 0.5  4: 1
@@ -703,11 +703,9 @@ class DynamicMaskHead(nn.Module):
                 j = j + delata[1]
                 assert i < self.grid_num[idx_all], (idx_all, idx, i, c_x, i_w, w, delata[0])
                 assert j < self.grid_num[idx_all], (idx_all, idx, j, c_y, i_h, h, delata[1])
-                w_l = int(i * i_w)  # 25x
-                w_r = int((self.grid_num[idx_all] - i - 1) * i_w)
-                h_u = int(j * i_h)
-                h_d = int((self.grid_num[idx_all] - j - 1) * i_h)
-                recover_mask = F.pad(mask_scores_per_level[idx], [w_l, w_r, h_u, h_d], mode='constant', value=0).unsqueeze(0)
+                recover_mask = torch.zeros([1, 1, 2 * H, 2 * W]).to(device=device)
+                _, r_h, r_w = mask_scores_per_level[idx].shape
+                recover_mask[:, :, int(j * i_h):int(j * i_h + r_h), int(i * i_w):int(i * i_w + r_w)] = mask_scores_per_level[idx]
                 clean_mask = torch.zeros_like(recover_mask)
                 _, _, r_h, r_w = clean_mask.shape
                 delta = 0
@@ -715,7 +713,7 @@ class DynamicMaskHead(nn.Module):
                 x2 = min(r_w - 1, box[2] + delta)
                 y1 = max(0, box[1] - delta)
                 y2 = min(r_h - 1, box[3] + delta)
-                clean_mask[:, :, int(y1):int(y2), int(x1):int(x2)] = 1
+                clean_mask[:, :, int(y1 + 0.5):int(y2 + 0.5), int(x1 + 0.5):int(x2 + 0.5)] = 1
                 recover_mask = recover_mask * clean_mask
                 if ins_id > len(recover_mask_scores):
                     recover_mask_scores.append(recover_mask)
