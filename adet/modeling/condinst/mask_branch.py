@@ -9,6 +9,7 @@ from detectron2.layers import ShapeSpec
 
 from adet.layers import conv_with_kaiming_uniform
 from adet.utils.comm import aligned_bilinear
+from torch.nn import functional as F
 
 
 INF = 100000000
